@@ -66,11 +66,228 @@ CÔNG CỤ CÓ SẴN:
 
 Cài đặt:  ReActAgent(..., middleware=[InjectionGuard(), Critic(), ...])
 Xem `harness/middleware.py` để biết thứ tự các hook.
+
+PHẦN LÀM THÊM — PHẢN BIỆN NGAY TRONG VÒNG LẶP (vì mô hình thật)
+================================================================
+`after_agent` chỉ XOÁ được: nó không cứu nổi một lượt chạy mà mô hình
+kết luận quá sớm hoặc trích thiếu. Ba điều đo/đọc được từ bộ chấm:
+
+  * Mô hình thật hay viết FINAL ngay lượt đầu, chưa gọi công cụ nào
+    (runner gắn cờ `single_model_call`, điểm rơi về mức sàn).
+  * Dữ kiện được chấm theo TỪNG claim, và ở 4/10 dữ kiện công khai không
+    câu đơn lẻ nào phủ đủ từ khoá — chỉ TRỌN DÒNG mới phủ. Lớp này không
+    được nối dài claim (chữ phải là của mô hình), nên chỉ còn cách bảo mô
+    hình chép trọn dòng.
+  * Mọi FINAL mô hình từng viết đều là chữ của mô hình, nên claim của một
+    FINAL trước đó vẫn dùng được: yêu cầu sửa không bao giờ làm mất chứng cứ.
+
+Vì thế lớp này còn dùng ba hook nữa:
+
+  `before_model`   nhắc một câu sau mỗi quan sát công cụ (đọc toàn văn,
+                   tìm lại nếu lệch chủ đề, chép trọn dòng).
+  `after_model`    đọc FINAL trước khi agent chấp nhận nó. Chưa tra cứu
+                   gì -> đổi thành một lượt search/fetch_doc. Có lỗi sửa
+                   được -> để lại ghi chú ở `ctx.state` cho agent gửi trả
+                   (tối đa `MAX_REVISIONS` lần, mỗi loại lỗi một lần).
+  `wrap_tool_call` ghi lại tài liệu nào đã đọc được, và với lượt tra cứu
+                   bắt buộc thì đọc luôn tài liệu đứng đầu kết quả.
 """
 
 from __future__ import annotations
 
+import re
+
+from arena.model import ModelResponse, is_degraded, render_action
+from arena.tools import ToolResult
+
+from harness import evidence
+from harness.agent import REVISION_REQUEST_KEY, final_report
 from harness.middleware import Middleware
+
+#: Một claim gần đúng chỉ được cứu bằng cách cắt bớt khi đoạn khớp nguyên
+#: văn đủ dài VÀ chiếm phần lớn claim. Dưới ngưỡng này thì thứ còn lại là
+#: vài chữ trùng ngẫu nhiên, không phải một trích dẫn.
+MIN_TRIMMED_CHARS = 30
+MIN_TRIMMED_SHARE = 0.6
+
+#: Chỗ mô hình có thể đã dán hai đoạn trích lại với nhau. Mô hình giả chỉ
+#: dùng " và "; mô hình thật dùng cả các liên từ và dấu câu còn lại.
+#: Khoảng trắng phía sau là lookahead để hai chỗ dán sát nhau ("… và và …",
+#: khi nửa đầu tự nó đã kết thúc bằng "và") đều được thử.
+_JOINT_RE = re.compile(r"\s+(?:và|nhưng|còn|hoặc|trong khi)(?=\s)|\s*[;,](?=\s)")
+
+#: Số claim tối đa giữ lại. Claim đúng mà không phủ dữ kiện nào chỉ được
+#: miễn phí tới (số dữ kiện + 2); với một dữ kiện thì claim thứ năm trở đi
+#: bắt đầu bị trừ precision.
+MAX_CLAIMS = 4
+
+#: Claim ngắn hơn ngần này mà dòng chứa nó còn dài hơn ít nhất
+#: `MIN_MISSING_CHARS` thì coi là trích thiếu dòng.
+FULL_ENOUGH_CHARS = 160
+MIN_MISSING_CHARS = 15
+
+#: Số lần tối đa một lượt chạy gửi FINAL về cho mô hình sửa.
+MAX_REVISIONS = 2
+
+#: Lượt công cụ để dành cho `submit`.
+RESERVE = 1
+
+FORCED_SEARCH_K = 5
+STATE_KEY = "critic"
+NOISE_MARK = "[NOISE:"
+
+ABSTAIN_ANSWER = (
+    "Không đủ căn cứ để trả lời: các tài liệu đã đọc không chứa bằng chứng "
+    "xác nhận cho câu hỏi này."
+)
+
+#: Trả về khi mô hình xin lại một tài liệu đã về nguyên vẹn: nội dung vẫn
+#: nằm trong ngữ cảnh, nên không tốn thêm một lượt công cụ cho nó.
+ALREADY_READ = "Toàn văn {doc_id} đã được đọc ở trên và không thay đổi; hãy dùng nội dung đó."
+
+THOUGHT_SEARCH = "Chưa tra cứu thì chưa được kết luận; tìm theo câu hỏi trước."
+THOUGHT_READ = "Mới xem trích đoạn, chưa đọc toàn văn; đọc tài liệu đứng đầu kết quả đã."
+
+REMIND_AFTER_SEARCH = (
+    "[Nhắc] Kết quả search chỉ là trích đoạn: hãy fetch_doc tài liệu đúng chủ đề để đọc toàn "
+    "văn trước khi kết luận. Nếu chưa có tài liệu nào đúng chủ đề hoặc phòng ban mà câu hỏi "
+    "nêu, hãy search lại bằng từ khoá khác (tên chủ đề như trong tiêu đề, kèm loại văn bản: "
+    "chính sách, hỏi đáp, báo cáo, ghi chú). Trong FINAL, mỗi claim chép nguyên văn TRỌN MỘT "
+    "DÒNG của tài liệu."
+)
+REMIND_AFTER_READ = (
+    "[Nhắc] Nếu tài liệu đã đọc không đúng chủ đề hoặc phòng ban mà câu hỏi nêu, hãy search "
+    "lại bằng từ khoá khác. Trong FINAL, mỗi claim chép nguyên văn TRỌN MỘT DÒNG của tài liệu "
+    "(cả dòng, đủ mọi câu và con số trên dòng đó), kèm doc_id của chính tài liệu chứa dòng ấy."
+)
+REMIND_FINAL = (
+    "[Nhắc] Trong FINAL, mỗi claim chép nguyên văn TRỌN MỘT DÒNG của tài liệu đã đọc (cả dòng, "
+    "đủ mọi câu và con số trên dòng đó), kèm doc_id của chính tài liệu chứa dòng ấy."
+)
+
+NOTE_HEADER = (
+    "FINAL trên CHƯA được nộp. Hãy sửa các điểm dưới đây rồi trả lời lại, vẫn đúng định dạng "
+    "(THOUGHT rồi ACTION, hoặc THOUGHT rồi FINAL); giữ nguyên những phần đã đúng."
+)
+NOTE_UNGROUNDED = (
+    "- Không claim nào khớp NGUYÊN VĂN với một dòng trong tài liệu đã quan sát. Mỗi claim phải "
+    "chép đúng từng ký tự TRỌN một dòng (không diễn đạt lại, không ghép hai dòng, không thêm "
+    "dấu câu), kèm doc_id của chính tài liệu chứa dòng đó."
+)
+NOTE_UNGROUNDED_TOOLS = (
+    " Nếu chưa đọc toàn văn thì fetch_doc trước; nếu tài liệu đã đọc không chứa câu trả lời "
+    "thì search lại bằng từ khoá khác."
+)
+NOTE_UNGROUNDED_NO_TOOLS = (
+    " Đã hết lượt công cụ: nếu không có dòng nào phù hợp thì đặt abstain là true và để claims rỗng."
+)
+NOTE_EMPTY = (
+    "- FINAL chưa có claim nào. Nếu tài liệu đã đọc có dòng trả lời câu hỏi, hãy chép nguyên "
+    "văn trọn dòng đó vào claims. Nếu tài liệu đã đọc nói rõ là chưa có dữ liệu, hoặc hai tài "
+    "liệu nói ngược nhau, hãy giữ abstain là true nhưng vẫn chép nguyên văn trọn (các) dòng "
+    "cho thấy điều đó vào claims."
+)
+NOTE_EMPTY_TOOLS = (
+    " Nếu chưa có tài liệu nào đúng chủ đề hoặc phòng ban mà câu hỏi nêu, hãy search lại bằng "
+    "từ khoá khác (tên chủ đề như trong tiêu đề, kèm loại văn bản: chính sách, hỏi đáp, báo "
+    "cáo, ghi chú) rồi fetch_doc."
+)
+NOTE_EMPTY_NO_TOOLS = " Nếu không có dòng nào như vậy thì viết lại đúng FINAL cũ."
+NOTE_FRAGMENT = (
+    "- Claim mới chỉ trích MỘT PHẦN của dòng: «{heads}». Hãy chép lại TRỌN CẢ DÒNG chứa nó, "
+    "từ ký tự đầu đến ký tự cuối dòng (đủ mọi câu và con số trên dòng đó), không thêm bớt "
+    "hay sửa chữ."
+)
+NOTE_VERDICT = (
+    '- Câu hỏi yêu cầu chọn ĐÚNG MỘT phương án: đặt khóa "verdict" bằng nguyên văn phương án '
+    "bạn chọn, chép từ câu hỏi; không nhắc tới phương án nào khác trong verdict."
+)
+
+
+def _split_fused(ctx, observed, text: str):
+    """Tách câu ghép tại đúng chỗ dán. Trả về hai claim, hoặc None."""
+    for joint in _JOINT_RE.finditer(text):
+        left, right = text[: joint.start()].strip(), text[joint.end() :].strip()
+        if not (evidence.grounded(observed, left) and evidence.grounded(observed, right)):
+            continue
+        left_id = evidence.source(ctx, left)
+        right_id = evidence.source(ctx, right, avoid=left_id)
+        if left_id and right_id:
+            return [
+                {"text": left, "doc_id": left_id},
+                {"text": right, "doc_id": right_id},
+            ]
+    return None
+
+
+def _quotation(ctx, observed, part: str, cited):
+    """CẮT BỚT một claim gần đúng về phần của nó có thật trong bằng chứng.
+
+    Mô hình thật hay thêm dấu chấm cuối câu, bọc nháy, hoặc mở đầu bằng
+    "Theo tài liệu, …". Phần còn lại vẫn là trích dẫn nguyên văn, và một
+    đoạn cắt ra từ chữ mô hình đã viết vẫn là chữ của mô hình — nên cắt là
+    hợp lệ, còn sửa thì không.
+    """
+    part = part.strip()
+    quote = part if evidence.grounded(observed, part) else evidence.longest_quote(ctx, part)
+    if quote != part and (
+        len(evidence.norm(quote)) < MIN_TRIMMED_CHARS
+        or len(quote) < MIN_TRIMMED_SHARE * len(part)
+    ):
+        return None  # phần khớp quá ít: diễn đạt lại hoặc bịa, không phải trích
+    if not evidence.grounded(observed, quote):
+        return None
+    doc_id = evidence.source(ctx, quote, prefer=cited)
+    return {"text": quote, "doc_id": doc_id} if doc_id else None
+
+
+def _pieces(ctx, observed, claim):
+    """Những gì còn dùng được của MỘT claim, và nó có phải câu ghép không."""
+    text = claim.get("text") if isinstance(claim, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        return [], False
+    if evidence.grounded(observed, text):
+        return [claim], False  # trích dẫn thật: giữ nguyên, KHÔNG sửa chữ
+    halves = _split_fused(ctx, observed, text)
+    if halves is not None:
+        return halves, halves[0]["doc_id"] != halves[1]["doc_id"]
+    # Dán nhiều dòng vào một claim: mỗi dòng là một trích dẫn riêng.
+    quotes = (_quotation(ctx, observed, part, claim.get("doc_id")) for part in text.splitlines())
+    return [quote for quote in quotes if quote], False
+
+
+def _select(ctx, claims):
+    """Các claim bằng chứng thật sự đỡ, và có câu ghép hai nguồn hay không."""
+    observed = evidence.lines(ctx)
+    kept, keys, fused = [], [], False
+    for claim in claims:
+        pieces, joined = _pieces(ctx, observed, claim)
+        fused = fused or joined
+        for piece in pieces:
+            key = evidence.norm(piece["text"])
+            if any(key in other for other in keys):
+                continue  # trích lại câu đã có, hoặc chỉ là một phần của nó
+            shorter = next((i for i, other in enumerate(keys) if other in key), None)
+            if shorter is None:
+                kept.append(piece)
+                keys.append(key)
+            else:  # bản trích dài hơn của cùng dòng thay cho bản ngắn
+                kept[shorter], keys[shorter] = piece, key
+    return kept[:MAX_CLAIMS], fused
+
+
+def _fragments(ctx, kept) -> list[str]:
+    """Những claim mới chỉ trích một phần của dòng chứa nó."""
+    partial = []
+    for claim in kept:
+        key = evidence.norm(claim["text"])
+        if len(key) >= FULL_ENOUGH_CHARS:
+            continue
+        doc_id = evidence.source(ctx, claim["text"], prefer=claim.get("doc_id"))
+        line = evidence.line_of(ctx, doc_id, claim["text"])
+        if line is not None and len(line) - len(key) >= MIN_MISSING_CHARS:
+            partial.append(claim["text"])
+    return partial
 
 
 class Critic(Middleware):
@@ -78,17 +295,261 @@ class Critic(Middleware):
 
     name = "critic"
 
+    # -- trạng thái của một lượt chạy ----------------------------------
+
+    def _state(self, ctx) -> dict:
+        state = ctx.state.get(STATE_KEY)
+        if not isinstance(state, dict):
+            state = {
+                "finals": [],    # mọi FINAL mô hình đã viết, theo thứ tự
+                "raised": [],    # loại lỗi đã yêu cầu sửa (mỗi loại một lần)
+                "revisions": 0,
+                "forced": [],    # công cụ đã phải gọi thay mô hình
+                "hits": [],      # doc_id trong kết quả search, mới nhất trước
+                "read": [],      # doc_id đã fetch về được nội dung
+                "whole": [],     # ... và nội dung đó về nguyên vẹn
+                "last_tool": "",
+            }
+            ctx.state[STATE_KEY] = state
+        return state
+
+    @staticmethod
+    def _room(ctx, calls: int) -> bool:
+        """Còn đủ ngân sách cho `calls` lượt công cụ nữa, chưa kể `submit`."""
+        limit = ctx.max_tool_calls
+        return limit is None or ctx.tools.calls + calls + RESERVE <= limit
+
+    # -- trước mỗi lượt gọi mô hình ------------------------------------
+
+    def before_model(self, ctx, messages):
+        # Chỉ nhắc ngay sau một quan sát công cụ. Lượt đầu tiên thì không
+        # bao giờ: ở đó `MockModel` coi message user cuối cùng là câu hỏi.
+        if not ctx.observations or not messages:
+            return messages
+        last = messages[-1]
+        if last.get("role") != "user" or last.get("content") != ctx.observations[-1]:
+            return messages
+        if not self._room(ctx, 1):
+            reminder = REMIND_FINAL
+        elif self._state(ctx)["last_tool"] == "search":
+            reminder = REMIND_AFTER_SEARCH
+        else:
+            reminder = REMIND_AFTER_READ
+        return messages + [{"role": "user", "content": reminder}]
+
+    # -- đọc FINAL trước khi agent chấp nhận nó ------------------------
+
+    def after_model(self, ctx, response):
+        final = final_report(getattr(response, "text", None))
+        if final is None:
+            return response
+        state = self._state(ctx)
+        state["finals"].append(final)
+
+        forced = self._look_first(ctx, state)
+        if forced is not None:
+            # Viết lại lượt này thành một ACTION. Trace đã ghi nguyên văn
+            # FINAL của mô hình trước khi hook này chạy, nên bộ chấm vẫn
+            # thấy đúng thứ mô hình nói.
+            thought, tool, args = forced
+            state["pending"] = tool
+            return ModelResponse(
+                text=render_action(thought, tool, args),
+                prompt_tokens=getattr(response, "prompt_tokens", 0),
+                completion_tokens=getattr(response, "completion_tokens", 0),
+            )
+
+        note = self._revision_note(ctx, final, state)
+        if note:
+            ctx.state[REVISION_REQUEST_KEY] = note
+        return response
+
+    def _look_first(self, ctx, state):
+        """Mô hình định kết luận khi chưa nhìn vào đâu cả: tra cứu thay nó."""
+        if ctx.tools.calls == 0:
+            if "search" in state["forced"] or not ctx.question or not self._room(ctx, 1):
+                return None
+            state["forced"].append("search")
+            return THOUGHT_SEARCH, "search", {"query": ctx.question, "k": FORCED_SEARCH_K}
+        if not state["read"]:
+            if "fetch_doc" in state["forced"] or not state["hits"] or not self._room(ctx, 1):
+                return None
+            state["forced"].append("fetch_doc")
+            return THOUGHT_READ, "fetch_doc", {"doc_id": state["hits"][0]}
+        return None
+
+    def _revision_note(self, ctx, final, state) -> str:
+        if state["revisions"] >= MAX_REVISIONS:
+            return ""
+        fresh = [
+            (kind, text)
+            for kind, text in self._issues(ctx, final, state)
+            if kind not in state["raised"]
+        ]
+        if not fresh:
+            return ""
+        state["revisions"] += 1
+        state["raised"].extend(kind for kind, _ in fresh)
+        return "\n".join([NOTE_HEADER] + [text for _, text in fresh])
+
+    def _issues(self, ctx, final, state) -> list[tuple]:
+        """Những lỗi của FINAL này mà một lượt viết lại có thể sửa được."""
+        claims = final.get("claims")
+        claims = claims if isinstance(claims, list) else []
+        kept, _ = _select(ctx, claims)
+        tools_left = self._room(ctx, 1)
+        wrote_claims = any(
+            isinstance(c, dict) and isinstance(c.get("text"), str) and c["text"].strip()
+            for c in claims
+        )
+
+        issues = []
+        if kept:
+            partial = _fragments(ctx, kept)
+            if partial:
+                heads = "», «".join(text[:60] for text in partial)
+                issues.append(("fragment", NOTE_FRAGMENT.format(heads=heads)))
+        elif wrote_claims:
+            tail = NOTE_UNGROUNDED_TOOLS if tools_left else NOTE_UNGROUNDED_NO_TOOLS
+            issues.append(("ungrounded", NOTE_UNGROUNDED + tail))
+        elif state["read"] or tools_left:
+            tail = NOTE_EMPTY_TOOLS if tools_left else NOTE_EMPTY_NO_TOOLS
+            issues.append(("empty", NOTE_EMPTY + tail))
+
+        options = evidence.verdict_options(ctx.question)
+        if options and len(evidence.stated_verdicts(final, options)) != 1:
+            issues.append(("verdict", NOTE_VERDICT))
+        return issues
+
+    # -- quanh mỗi lượt gọi công cụ ------------------------------------
+
+    def wrap_tool_call(self, ctx, call, name, args):
+        state = self._state(ctx)
+        forced = state.pop("pending", None)
+        doc_id = args.get("doc_id") if isinstance(args, dict) else None
+        if name == "fetch_doc" and forced is None and doc_id in state["whole"]:
+            state["last_tool"] = name
+            return ToolResult(ok=True, content=ALREADY_READ.format(doc_id=doc_id), error=None)
+        result = call(name, args)
+        state["last_tool"] = name
+        self._record(state, name, args, result)
+        if forced == name:
+            result = self._read_ahead(ctx, call, state, result, first_is_free=name == "search")
+        return result
+
+    @staticmethod
+    def _record(state, name, args, result) -> None:
+        content = getattr(result, "content", None)
+        if not getattr(result, "ok", False) or not isinstance(content, str) or not content:
+            return
+        if name == "search":
+            hits = []
+            for doc_id in evidence.DOC_ID_RE.findall(content):
+                if doc_id not in hits:
+                    hits.append(doc_id)
+            if hits:
+                state["hits"] = hits + [d for d in state["hits"] if d not in hits]
+        elif name == "fetch_doc" and NOISE_MARK not in content:
+            doc_id = args.get("doc_id") if isinstance(args, dict) else None
+            if isinstance(doc_id, str) and doc_id not in state["read"]:
+                state["read"].append(doc_id)
+            if isinstance(doc_id, str) and not is_degraded(content) and doc_id not in state["whole"]:
+                state["whole"].append(doc_id)
+
+    def _read_ahead(self, ctx, call, state, result, *, first_is_free: bool):
+        """Đọc luôn tài liệu đứng đầu kết quả, nối vào cùng một quan sát.
+
+        Chỉ dùng cho lượt tra cứu BẮT BUỘC: mô hình đã tỏ ra không tự đọc,
+        nên đưa toàn văn tới trước mặt nó thay vì chờ thêm một lượt. Tài
+        liệu thêm chỉ được đọc khi sau đó vẫn còn đủ một lượt search và
+        một lượt fetch_doc cho mô hình tự tìm lại.
+        """
+        content = getattr(result, "content", None)
+        if not isinstance(content, str):
+            return result
+        wanted = 2 if first_is_free else 1
+        done = 0
+        for doc_id in list(state["hits"]):
+            if done >= wanted:
+                break
+            if doc_id in state["read"]:
+                continue
+            if not self._room(ctx, 1 if (first_is_free and done == 0) else 3):
+                break
+            extra = call("fetch_doc", {"doc_id": doc_id})
+            done += 1
+            self._record(state, "fetch_doc", {"doc_id": doc_id}, extra)
+            if getattr(extra, "ok", False) and isinstance(extra.content, str) and extra.content:
+                content = f"{content}\n\n[Toàn văn {doc_id}]\n{extra.content}"
+        if not done:
+            return result
+        return ToolResult(ok=result.ok, content=content, error=result.error)
+
+    # -- sau vòng lặp, trước khi nộp ------------------------------------
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        state = self._state(ctx)
+        finals = state["finals"]
+        if not report and finals:
+            # Vòng lặp hết bước sau khi một FINAL bị trả về: bản FINAL gần
+            # nhất vẫn là câu trả lời của mô hình.
+            report = dict(finals[-1])
+
+        claims = report.get("claims")
+        claims = list(claims) if isinstance(claims, list) else []
+        # Claim của các FINAL trước cũng là chữ mô hình đã viết: gộp lại để
+        # một lần yêu cầu sửa không bao giờ làm mất chứng cứ đã có.
+        own = [evidence.norm(c.get("text")) for c in claims if isinstance(c, dict)]
+        for final in reversed(finals):
+            earlier = final.get("claims")
+            for claim in earlier if isinstance(earlier, list) else []:
+                if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                    continue
+                if evidence.norm(claim["text"]) in own:
+                    continue
+                own.append(evidence.norm(claim["text"]))
+                doc_id = evidence.source(ctx, claim["text"], prefer=claim.get("doc_id"))
+                claims.append({**claim, "doc_id": doc_id} if doc_id else claim)
+
+        kept, fused = _select(ctx, claims)
+        options = evidence.verdict_options(ctx.question)
+        if options:
+            self._settle_verdict(report, finals, options)
+
+        report["claims"] = kept
+        if not kept:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = ABSTAIN_ANSWER
+            return report
+        if fused:
+            # Hai nguồn khác nhau bị ghép thành một câu: nêu cả hai phía
+            # rồi từ chối chọn bên.
+            report["abstain"] = True
+        elif options and len(evidence.stated_verdicts(report, options)) == 1:
+            # Đã chọn đúng một kết luận và có trích dẫn đỡ cho nó thì là
+            # đã trả lời, không phải từ chối trả lời.
+            report["abstain"] = False
+        report["citations"] = sorted(
+            {c["doc_id"] for c in kept if isinstance(c.get("doc_id"), str) and c["doc_id"]}
+        )
+        return report
+
+    @staticmethod
+    def _settle_verdict(report, finals, options) -> None:
+        """Đưa kết luận mô hình ĐÃ chọn về đúng trường `verdict`.
+
+        Không chọn thay mô hình: chỉ lấy lại một kết luận duy nhất mà chính
+        nó đã viết — ở trường `verdict` của một FINAL trước, hoặc trong
+        `answer` — khi trường `verdict` hiện tại không nêu đúng một phương án.
+        """
+        if len(evidence.stated_verdicts(report, options)) == 1:
+            return
+        for final in reversed(finals):
+            verdict = final.get("verdict")
+            if verdict and len(evidence.asserted_options(verdict, options)) == 1:
+                report["verdict"] = verdict
+                return
+        in_answer = evidence.asserted_options(report.get("answer"), options)
+        if len(in_answer) == 1:
+            report["verdict"] = in_answer[0]

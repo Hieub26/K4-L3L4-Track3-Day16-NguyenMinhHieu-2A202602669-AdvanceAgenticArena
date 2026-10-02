@@ -50,8 +50,8 @@ THE LOOP, IN ORDER
 layer the mock needs 31 model turns to reach a FINAL; a cap below that
 produces no report at all, silently, and only on the unlucky seeds.
 
-TWO THINGS THIS AGENT DOES ON PURPOSE, AND WHY
-==============================================
+THREE THINGS THIS AGENT DOES ON PURPOSE, AND WHY
+================================================
 
 1. `before_model` is applied to a COPY of the history, and only the raw
    response and the raw observation are appended back. So a layer that
@@ -62,6 +62,14 @@ TWO THINGS THIS AGENT DOES ON PURPOSE, AND WHY
    agent chose, and a `retry` layer that re-submitted would spend budget
    the scorer counts (`tools.calls` includes `submit`) for nothing: a
    timed-out submit still records the report verbatim on the trace.
+3. A FINAL is not necessarily the end. A layer that reads the model's
+   FINAL in `after_model` and finds it wanting may leave a note under
+   `ctx.state[REVISION_REQUEST_KEY]`; the agent then shows the model its
+   own FINAL followed by that note and lets it answer again, at most
+   `MAX_FINAL_REVISIONS` times per run. With no layer installed nothing
+   ever sets the key and a FINAL ends the run exactly as before. The note
+   goes into the HISTORY, never into `ctx.observations`: it is the
+   harness talking, not evidence, and no claim may be checked against it.
 
 THE SYSTEM PROMPT THIS AGENT SENDS
 ==================================
@@ -152,6 +160,17 @@ REPORT_KEYS = ("answer", "claims", "abstain", "citations")
 #: appends an ACTION to every FINAL would otherwise never be allowed to
 #: finish. After this many deferrals the FINAL is taken at face value.
 MAX_FINAL_DEFERRALS = 2
+
+#: Where a layer leaves the note that sends a FINAL back for one more pass
+#: (point 3 of the module docstring). Read — and cleared — every turn, so
+#: a note written about one turn can never be applied to a later one.
+REVISION_REQUEST_KEY = "final_revision_request"
+
+#: How many times ONE RUN may send a FINAL back to the model. Bounded for
+#: the same reason `MAX_FINAL_DEFERRALS` is: each one costs a full model
+#: turn, and a layer that objected to every FINAL would never let the
+#: model finish.
+MAX_FINAL_REVISIONS = 2
 
 #: What a model writes where CONTENT belongs when it is QUOTING the
 #: protocol instead of answering: the template's own `...`, an ellipsis,
@@ -392,6 +411,25 @@ def _action_under_final(text: str):
     return None
 
 
+def final_report(text: str):
+    """The report this turn would END THE RUN on, or None.
+
+    For a layer's `after_model`: the same three tests `ReActAgent._parse`
+    applies, in the same order, so a layer and the agent never disagree
+    about whether a turn is a FINAL. A turn the agent would put aside — a
+    quoted template, or a FINAL with an ACTION written under it — is not
+    one, and a layer should leave it alone.
+    """
+    if not isinstance(text, str):
+        return None
+    parsed = parse_output(_canonicalise(text))
+    if parsed.kind != "final" or not _is_report_payload(parsed.final):
+        return None
+    if _action_under_final(text) is not None:
+        return None
+    return parsed.final
+
+
 @dataclass
 class AgentContext:
     """Everything a layer is allowed to see, in one object.
@@ -487,6 +525,7 @@ class ReActAgent:
         # belongs to the layers.
         self._final_deferrals = 0
         self._refused_final: dict | None = None
+        self._final_revisions = 0
 
     # -- the run -------------------------------------------------------
 
@@ -503,6 +542,7 @@ class ReActAgent:
         self.last_context = ctx
         self._final_deferrals = 0
         self._refused_final = None
+        self._final_revisions = 0
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
@@ -516,6 +556,9 @@ class ReActAgent:
         ctx.stop_reason = "max_steps"
         for step in range(self.max_steps):
             ctx.step = step
+            # A revision note is about ONE turn: whatever a layer left
+            # behind last turn is stale by now.
+            ctx.state.pop(REVISION_REQUEST_KEY, None)
 
             outbound = self.middleware.before_model(ctx, list(ctx.messages))
             response = self.middleware.wrap_model_call(ctx, self._call_model)(outbound)
@@ -532,6 +575,21 @@ class ReActAgent:
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
+                note = ctx.state.pop(REVISION_REQUEST_KEY, None)
+                if (
+                    isinstance(note, str)
+                    and note.strip()
+                    and self._final_revisions < MAX_FINAL_REVISIONS
+                ):
+                    # A layer wants this FINAL revised. The model sees its
+                    # own FINAL and then the note, and answers again. The
+                    # FINAL is remembered, so asking can only ever buy a
+                    # better report — never lose the one already written.
+                    self._final_revisions += 1
+                    if isinstance(parsed.final, dict):
+                        self._refused_final = parsed.final
+                    ctx.messages.append({"role": "user", "content": note})
+                    continue
                 report = parsed.final if isinstance(parsed.final, dict) else {}
                 ctx.stop_reason = "final"
                 break
@@ -690,6 +748,9 @@ __all__ = [
     "ReActAgent",
     "Middleware",
     "MAX_STEPS",
+    "MAX_FINAL_REVISIONS",
+    "REVISION_REQUEST_KEY",
+    "final_report",
     "ARENA_SYSTEM_PROMPT_REAL",
     "REAL_MODEL_PROMPT_ADDENDUM",
     "real_model_system_prompt",

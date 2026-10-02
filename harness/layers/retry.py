@@ -61,7 +61,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import is_degraded  # noqa: F401  (dùng trong phần TODO)
+from arena.model import is_degraded
 
 from harness.middleware import Middleware
 
@@ -70,6 +70,14 @@ DEFAULT_MAX_ATTEMPTS = 3
 
 #: Số lượt để dành cho `submit` mà agent vẫn còn phải gọi.
 DEFAULT_RESERVE = 1
+
+#: Lỗi không phụ thuộc vào may rủi của tầng công cụ (xem `arena/tools.py`
+#: và `ReActAgent._dispatch`).
+PERMANENT_ERRORS = ("doc not found:", "invalid expression:", "unknown tool:")
+
+#: Dấu tầng công cụ gắn vào một kết quả `ok=True` nhưng đã hỏng.
+TRUNCATED_MARK = "[TRUNCATED:"
+NOISE_MARK = "[NOISE:"
 
 
 class Retry(Middleware):
@@ -85,17 +93,41 @@ class Retry(Middleware):
         self.max_attempts = max(1, int(max_attempts))
         self.reserve = max(0, int(reserve))
 
+    def _retryable(self, result) -> bool:
+        """Kết quả này hỏng theo kiểu mà gọi lại CÓ THỂ sửa được không."""
+        if result.ok:
+            return is_degraded(result.content)  # bị cắt / nhiễu vẫn về ok=True
+        error = result.error or ""
+        # Lỗi tất định: gọi lại bao nhiêu lần cũng ra đúng lỗi đó, chỉ tốn
+        # ngân sách.
+        return not any(marker in error for marker in PERMANENT_ERRORS)
+
+    def _budget_left(self, ctx) -> bool:
+        limit = ctx.max_tool_calls
+        return limit is None or ctx.tools.calls < limit - self.reserve
+
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§7): khoảng 8-12 dòng.
-        #  1. Trong khi số lần đã thử < self.max_attempts VÀ kết quả còn
-        #     hỏng — tức `(not result.ok) or is_degraded(result.content)` —
-        #     thì gọi lại `call(name, args)` với ĐÚNG name/args cũ.
-        #  2. DỪNG THỬ LẠI khi ngân sách đã cạn: nếu
-        #     `ctx.max_tool_calls` khác None và
-        #     `ctx.tools.calls >= ctx.max_tool_calls - self.reserve`
-        #     thì đừng gọi thêm lượt nào nữa (xem phần cảnh báo ở trên).
-        #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
-        #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
-        #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        attempts = 1
+        partial = None  # bản bị cắt dài nhất đã thấy: vẫn là bằng chứng thật
+        while (
+            attempts < self.max_attempts
+            and self._retryable(result)
+            and self._budget_left(ctx)
+        ):
+            if result.ok and TRUNCATED_MARK in result.content:
+                if partial is None or len(result.content) > len(partial.content):
+                    partial = result
+            result = call(name, args)  # ĐÚNG name/args cũ, chỉ số lượt gọi mới
+            attempts += 1
+
+        ctx.state["retry_attempts"] = ctx.state.get("retry_attempts", 0) + attempts - 1
+        if partial is not None and (
+            not result.ok
+            or NOISE_MARK in result.content
+            or (TRUNCATED_MARK in result.content and len(result.content) < len(partial.content))
+        ):
+            # Mọi lần thử đều hỏng: trả về bản giữ được nhiều nội dung nhất
+            # (vẫn mang dấu [TRUNCATED), không bịa gì thêm.
+            return partial
+        return result

@@ -59,6 +59,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness import evidence
 from harness.middleware import Middleware
 
 
@@ -67,17 +68,39 @@ class CitationChecker(Middleware):
 
     name = "citation_checker"
 
+    def wrap_tool_call(self, ctx, call, name, args):
+        # Scorer coi một lượt fetch_doc là "đã truy xuất" kể cả khi nội dung
+        # về bị cắt, nên ghi lại doc_id đã hỏi chứ không chỉ nội dung đã về.
+        doc_id = args.get("doc_id") if name == "fetch_doc" and isinstance(args, dict) else None
+        if isinstance(doc_id, str) and ctx.corpus is not None and ctx.corpus.get(doc_id):
+            fetched = ctx.state.setdefault(evidence.FETCHED_KEY, [])
+            if doc_id not in fetched:
+                fetched.append(doc_id)
+        return call(name, args)
+
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            cited = claim.get("doc_id")
+            # `prefer=cited`: trích dẫn đã đúng (đúng dòng, tài liệu đã truy
+            # xuất) thì giữ nguyên; nếu không thì lấy tài liệu đã truy xuất
+            # thật sự chứa dòng đó.
+            source = evidence.source(ctx, claim["text"], prefer=cited)
+            if source is not None and source != cited:
+                claim["doc_id"] = source  # đổi nguồn, GIỮ NGUYÊN text
+                ctx.state["citations_fixed"] = ctx.state.get("citations_fixed", 0) + 1
+            # không tìm được nguồn -> để `critic` xử lý, không bịa doc_id
+
+        report["citations"] = sorted(
+            {
+                c["doc_id"]
+                for c in claims
+                if isinstance(c, dict) and isinstance(c.get("doc_id"), str) and c["doc_id"]
+            }
+        )
+        return report
