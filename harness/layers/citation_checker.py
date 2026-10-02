@@ -59,7 +59,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from harness import evidence
+from harness.layers import critic as evidence
 from harness.middleware import Middleware
 
 
